@@ -81,7 +81,7 @@ let requireOverrides = [];
 function doRequire(handlerPath) {
   const override = requireOverrides[handlerPath];
   if (override) {
-    debugLog(`Calling overridden require for ${key}`);
+    debugLog(`Calling overridden require for ${handlerPath}`);
     return override();
   }
   return require(handlerPath);
