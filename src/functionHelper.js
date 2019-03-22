@@ -216,8 +216,8 @@ module.exports = {
 
   // Takes options: { handlerPath: 'foo', handlerName: 'baz', doRequire: () => my_require('foo') }
   overrideRequire(options) {
-    debugLog(`Overriding require for ${handlerPath}`);
-    requireOverrides[handlerPath] = options.doRequire
+    debugLog(`Overriding require for ${options.handlerPath}`);
+    requireOverrides[options.handlerPath] = options.doRequire
   },
 
   cleanup() {
