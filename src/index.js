@@ -1,18 +1,14 @@
-'use strict';
-
 // Node dependencies
 const fs = require('fs');
 const path = require('path');
-const exec = require('child_process').exec;
+const { exec } = require('child_process');
 
 // External dependencies
 const Hapi = require('hapi');
 const corsHeaders = require('hapi-cors-headers');
-const _ = require('lodash');
 const crypto = require('crypto');
 
 // Internal lib
-require('./javaHelper');
 const debugLog = require('./debugLog');
 const jsonPath = require('./jsonPath');
 const createLambdaContext = require('./createLambdaContext');
@@ -22,10 +18,15 @@ const renderVelocityTemplateObject = require('./renderVelocityTemplateObject');
 const createAuthScheme = require('./createAuthScheme');
 const functionHelper = require('./functionHelper');
 const Endpoint = require('./Endpoint');
+const parseResources = require('./parseResources');
+const utils = require('./utils');
+const authFunctionNameExtractor = require('./authFunctionNameExtractor');
+const requestBodyValidator = require('./requestBodyValidator');
 
 /*
- I'm against monolithic code like this file, but splitting it induces unneeded complexity.
- */
+  I'm against monolithic code like this file
+  but splitting it induces unneeded complexity.
+*/
 class Offline {
 
   constructor(serverless, options) {
@@ -34,8 +35,6 @@ class Offline {
     this.serverlessLog = serverless.cli.log.bind(serverless.cli);
     this.options = options;
     this.exitCode = 0;
-    this.provider = 'aws';
-    this.start = this.start.bind(this);
 
     this.commands = {
       offline: {
@@ -76,6 +75,9 @@ class Offline {
             usage: 'Tells the plugin to skip require cache invalidation. A script reloading tool like Nodemon might then be needed',
             shortcut: 'c',
           },
+          cacheInvalidationRegex: {
+            usage: 'Provide the plugin with a regexp to use for cache invalidation. Default: node_modules',
+          },
           httpsProtocol: {
             usage: 'To enable HTTPS, specify directory (relative to your cwd, typically your project dir) for both cert.pem and key.pem files.',
             shortcut: 'H',
@@ -89,10 +91,13 @@ class Offline {
             shortcut: 't',
           },
           noEnvironment: {
-            usage: 'Turns of loading of your environment variables from serverless.yml. Allows the usage of tools such as PM2 or docker-compose.',
+            usage: 'Turns off loading of your environment variables from serverless.yml. Allows the usage of tools such as PM2 or docker-compose.',
           },
-          dontPrintOutput: {
-            usage: 'Turns of logging of your lambda outputs in the terminal.',
+          resourceRoutes: {
+            usage: 'Turns on loading of your HTTP proxy settings from serverless.yml.',
+          },
+          printOutput: {
+            usage: 'Outputs your lambda response to the terminal.',
           },
           corsAllowOrigin: {
             usage: 'Used to build the Access-Control-Allow-Origin header for CORS support.',
@@ -100,14 +105,38 @@ class Offline {
           corsAllowHeaders: {
             usage: 'Used to build the Access-Control-Allow-Headers header for CORS support.',
           },
+          corsExposedHeaders: {
+            usage: 'USed to build the Access-Control-Exposed-Headers response header for CORS support',
+          },
           corsDisallowCredentials: {
             usage: 'Used to override the Access-Control-Allow-Credentials default (which is true) to false.',
           },
           apiKey: {
-            usage: 'Defines the api key value to be used for endpoints marked as private. Defaults to a random hash.',
+            usage: 'Defines the API key value to be used for endpoints marked as private. Defaults to a random hash.',
           },
           exec: {
-            usage: 'When provided, a shell script is executed when the server starts up, and the server will shut domn after handling this command.',
+            usage: 'When provided, a shell script is executed when the server starts up, and the server will shut down after handling this command.',
+          },
+          noAuth: {
+            usage: 'Turns off all authorizers',
+          },
+          useSeparateProcesses: {
+            usage: 'Uses separate node processes for handlers',
+          },
+          preserveTrailingSlash: {
+            usage: 'Used to keep trailing slashes on the request path',
+          },
+          disableCookieValidation: {
+            usage: 'Used to disable cookie-validation on hapi.js-server',
+          },
+          enforceSecureCookies: {
+            usage: 'Enforce secure cookies',
+          },
+          providedRuntime: {
+            usage: 'Sets the provided runtime for lambdas',
+          },
+          disableModelValidation: {
+            usage: 'Disables the Model Validator',
           },
         },
       },
@@ -137,38 +166,49 @@ class Offline {
     process.env.IS_OFFLINE = true;
 
     return Promise.resolve(this._buildServer())
-    .then(() => this._listen())
-    .then(() => this.options.exec ? this._executeShellScript() : this._listenForSigInt())
-    .then(() => this.end());
+      .then(() => this._listen())
+      .then(() => this.options.exec ? this._executeShellScript() : this._listenForTermination())
+      .then(() => this.end());
   }
 
   _checkVersion() {
-    const version = this.serverless.version;
+    const { version } = this.serverless;
+
     if (!version.startsWith('1.')) {
       this.serverlessLog(`Offline requires Serverless v1.x.x but found ${version}. Exiting.`);
       process.exit(0);
     }
   }
 
-  _listenForSigInt() {
-    // Listen for ctrl+c to stop the server
-    return new Promise(resolve => {
-      process.on('SIGINT', () => {
-        this.serverlessLog('Offline Halting...');
-        resolve();
-      });
+  _listenForTermination() {
+    // SIGINT will be usually sent when user presses ctrl+c
+    const waitForSigInt = new Promise(resolve => {
+      process.on('SIGINT', () => resolve('SIGINT'));
+    });
+
+    // SIGTERM is a default termination signal in many cases,
+    // for example when "killing" a subprocess spawned in node
+    // with child_process methods
+    const waitForSigTerm = new Promise(resolve => {
+      process.on('SIGTERM', () => resolve('SIGTERM'));
+    });
+
+    return Promise.race([waitForSigInt, waitForSigTerm]).then(command => {
+      this.serverlessLog(`Got ${command} signal. Offline Halting...`);
     });
   }
 
   _executeShellScript() {
     const command = this.options.exec;
+    const options = { env: Object.assign({ IS_OFFLINE: true }, this.service.provider.environment, this.originalEnvironment) };
 
     this.serverlessLog(`Offline executing script [${command}]`);
 
     return new Promise(resolve => {
-      exec(command, (error, stdout, stderr) => {
+      exec(command, options, (error, stdout, stderr) => {
         this.serverlessLog(`exec stdout: [${stdout}]`);
         this.serverlessLog(`exec stderr: [${stderr}]`);
+
         if (error) {
           // Use the failed command's exit code, proceed as normal so that shutdown can occur gracefully
           this.serverlessLog(`Offline error executing script [${error}]`);
@@ -184,11 +224,11 @@ class Offline {
     this.requests = {};
 
     // Methods
-    this._setOptions();     // Will create meaningful options from cli options
-    this._setEnvironment(); // will set environment variables from serverless.yml file
-    this._registerBabel();  // Support for ES6
-    this._createServer();   // Hapijs boot
-    this._createRoutes();   // API  Gateway emulation
+    this._setOptions(); // Will create meaningful options from cli options
+    this._storeOriginalEnvironment(); // stores the original process.env for assigning upon invoking the handlers
+    this._createServer(); // Hapijs boot
+    this._createRoutes(); // API  Gateway emulation
+    this._createResourceRoutes(); // HTTP Proxy defined in Resource
     this._create404Route(); // Not found handling
 
     return this.server;
@@ -201,23 +241,14 @@ class Offline {
     functionHelper.overrideRequire(options);
   }
 
-  _setEnvironment() {
-    if (this.options.noEnvironment) return;
-
-    Object.assign(process.env, this.service.provider.environment || {});
-
-    const _this = this;
-
-    Object.keys(this.service.functions).forEach(functionName => {
-      Object.assign(process.env, _this.service.functions[functionName].environment || {});
-    });
+  _storeOriginalEnvironment() {
+    this.originalEnvironment = Object.assign({}, process.env);
   }
 
   _setOptions() {
     // Merge the different sources of values for this.options
     // Precedence is: command line options, YAML options, defaults.
-
-    const defaultOpts = {
+    const defaultOptions = {
       host: 'localhost',
       location: '.',
       port: 3000,
@@ -226,22 +257,36 @@ class Offline {
       region: this.service.provider.region,
       noTimeout: false,
       noEnvironment: false,
-      dontPrintOutput: false,
+      resourceRoutes: false,
+      printOutput: false,
       httpsProtocol: '',
       skipCacheInvalidation: false,
+      cacheInvalidationRegex: 'node_modules',
+      exec: '',
+      noAuth: false,
       corsAllowOrigin: '*',
-      corsAllowHeaders: 'accept,content-type,x-api-key',
+      corsExposedHeaders: 'WWW-Authenticate,Server-Authorization',
+      corsAllowHeaders: 'accept,content-type,x-api-key,authorization',
       corsAllowCredentials: true,
       apiKey: crypto.createHash('md5').digest('hex'),
+      useSeparateProcesses: false,
+      preserveTrailingSlash: false,
+      disableCookieValidation: false,
+      enforceSecureCookies: false,
+      providedRuntime: '',
+      disableModelValidation: false,
     };
 
-    this.options = _.merge({}, defaultOpts, (this.service.custom || {})['serverless-offline'], this.options);
+    // In the constructor, stage and regions are set to undefined
+    if (this.options.stage === undefined) delete this.options.stage;
+    if (this.options.region === undefined) delete this.options.region;
+
+    const yamlOptions = (this.service.custom || {})['serverless-offline'];
+    this.options = Object.assign({}, defaultOptions, yamlOptions, this.options);
 
     // Prefix must start and end with '/'
     if (!this.options.prefix.startsWith('/')) this.options.prefix = `/${this.options.prefix}`;
     if (!this.options.prefix.endsWith('/')) this.options.prefix += '/';
-
-    this.globalBabelOptions = ((this.service.custom || {})['serverless-offline'] || {}).babelOptions;
 
     this.velocityContextOptions = {
       stageVariables: {}, // this.service.environment.stages[this.options.stage].vars,
@@ -251,6 +296,7 @@ class Offline {
     // Parse CORS options
     this.options.corsAllowOrigin = this.options.corsAllowOrigin.replace(/\s/g, '').split(',');
     this.options.corsAllowHeaders = this.options.corsAllowHeaders.replace(/\s/g, '').split(',');
+    this.options.corsExposedHeaders = this.options.corsExposedHeaders.replace(/\s/g, '').split(',');
 
     if (this.options.corsDisallowCredentials) this.options.corsAllowCredentials = false;
 
@@ -258,27 +304,13 @@ class Offline {
       origin: this.options.corsAllowOrigin,
       headers: this.options.corsAllowHeaders,
       credentials: this.options.corsAllowCredentials,
+      exposedHeaders: this.options.corsExposedHeaders,
     };
+
+    this.options.cacheInvalidationRegex = new RegExp(this.options.cacheInvalidationRegex);
 
     this.serverlessLog(`Starting Offline: ${this.options.stage}/${this.options.region}.`);
     debugLog('options:', this.options);
-    debugLog('globalBabelOptions:', this.globalBabelOptions);
-  }
-
-  _registerBabel(isBabelRuntime, babelRuntimeOptions) {
-    const options = isBabelRuntime ?
-      babelRuntimeOptions || { presets: ['es2015'] } :
-      this.globalBabelOptions;
-
-    if (options) {
-      debugLog('Setting babel register:', options);
-
-      // We invoke babel-register only once
-      if (!this.babelRegister) {
-        debugLog('For the first time');
-        this.babelRegister = require('babel-register')(options);
-      }
-    }
   }
 
   _createServer() {
@@ -286,15 +318,18 @@ class Offline {
     this.server = new Hapi.Server({
       connections: {
         router: {
-          stripTrailingSlash: true, // removes trailing slashes on incoming paths.
+          stripTrailingSlash: !this.options.preserveTrailingSlash, // removes trailing slashes on incoming paths.
         },
       },
     });
+
+    this.server.register(require('h2o2'), err => err && this.serverlessLog(err));
 
     const connectionOptions = {
       host: this.options.host,
       port: this.options.port,
     };
+
     const httpsDir = this.options.httpsProtocol;
 
     // HTTPS support
@@ -305,6 +340,16 @@ class Offline {
       };
     }
 
+    connectionOptions.state = this.options.enforceSecureCookies ? {
+      isHttpOnly: true,
+      isSecure: true,
+      isSameSite: false,
+    } : {
+        isHttpOnly: false,
+        isSecure: false,
+        isSameSite: false,
+      };
+
     // Passes the configuration object to the server
     this.server.connection(connectionOptions);
 
@@ -313,12 +358,29 @@ class Offline {
   }
 
   _createRoutes() {
+    let serviceRuntime = this.service.provider.runtime;
     const defaultContentType = 'application/json';
-    const serviceRuntime = this.service.provider.runtime;
     const apiKeys = this.service.provider.apiKeys;
     const protectedRoutes = [];
 
-    if (['nodejs', 'nodejs4.3', 'nodejs6.10', 'babel'].indexOf(serviceRuntime) === -1) {
+    if (!serviceRuntime) {
+      throw new Error('Missing required property "runtime" for provider.');
+    }
+
+    if (typeof serviceRuntime !== 'string') {
+      throw new Error('Provider configuration property "runtime" wasn\'t a string.');
+    }
+
+    if (serviceRuntime === 'provided') {
+      if (this.options.providedRuntime) {
+        serviceRuntime = this.options.providedRuntime;
+      }
+      else {
+        throw new Error('Runtime "provided" is unsupported. Please add a --providedRuntime CLI option.');
+      }
+    }
+
+    if (!(serviceRuntime.startsWith('nodejs') || serviceRuntime.startsWith('python') || serviceRuntime.startsWith('ruby'))) {
       this.printBlankLine();
       this.serverlessLog(`Warning: found unsupported runtime '${serviceRuntime}'`);
 
@@ -326,9 +388,15 @@ class Offline {
     }
 
     // for simple API Key authentication model
-    if (!_.isEmpty(apiKeys)) {
+    if (apiKeys) {
       this.serverlessLog(`Key with token: ${this.options.apiKey}`);
-      this.serverlessLog('Remember to use x-api-key on the request headers');
+
+      if (this.options.noAuth) {
+        this.serverlessLog('Authorizers are turned off. You do not need to use x-api-key header.');
+      }
+      else {
+        this.serverlessLog('Remember to use x-api-key on the request headers');
+      }
     }
 
     Object.keys(this.service.functions).forEach(key => {
@@ -336,19 +404,16 @@ class Offline {
       const fun = this.service.getFunction(key);
       const funName = key;
       const servicePath = path.join(this.serverless.config.servicePath, this.options.location);
-      const funOptions = functionHelper.getFunctionOptions(fun, key, servicePath);
+      const funOptions = functionHelper.getFunctionOptions(fun, key, servicePath, serviceRuntime);
 
+      debugLog(`funOptions ${JSON.stringify(funOptions, null, 2)} `);
       this.printBlankLine();
-      debugLog(funName, 'runtime', serviceRuntime, funOptions.babelOptions || '');
+      debugLog(funName, 'runtime', serviceRuntime);
       this.serverlessLog(`Routes for ${funName}:`);
 
       // Adds a route for each http endpoint
-      fun.events && fun.events.forEach(event => {
-
-        if (!event.http) return;
-        if (_.eq(event.http.private, true)) {
-          protectedRoutes.push(`/${event.http.path}`);
-        }
+      (fun.events && fun.events.length || this.serverlessLog('(none)')) && fun.events.forEach(event => {
+        if (!event.http) return this.serverlessLog('(none)');
 
         // Handle Simple http setup, ex. - http: GET users/index
         if (typeof event.http === 'string') {
@@ -362,9 +427,10 @@ class Offline {
         // generate an enpoint via the endpoint class
         const endpoint = new Endpoint(event.http, funOptions).generate();
 
-        let firstCall = true;
-
         const integration = endpoint.integration || 'lambda-proxy';
+        const requestBodyValidationModel = (['lambda', 'lambda-proxy'].includes(integration)
+          ? requestBodyValidator.getModel(this.service.custom, event.http, this.serverlessLog)
+          : null);
         const epath = endpoint.path;
         const method = endpoint.method.toUpperCase();
         const requestTemplates = endpoint.requestTemplates;
@@ -374,64 +440,14 @@ class Offline {
         if (fullPath !== '/' && fullPath.endsWith('/')) fullPath = fullPath.slice(0, -1);
         fullPath = fullPath.replace(/\+}/g, '*}');
 
-        this.serverlessLog(`${method} ${fullPath}`);
+        if (event.http.private) {
+          protectedRoutes.push(`${method}#${fullPath}`);
+        }
+
+        this.serverlessLog(`${method} ${fullPath}${requestBodyValidationModel && !this.options.disableModelValidation ? ` - request body will be validated against ${requestBodyValidationModel.name}` : ''}`);
 
         // If the endpoint has an authorization function, create an authStrategy for the route
-        let authStrategyName = null;
-
-        if (endpoint.authorizer) {
-          let authFunctionName = endpoint.authorizer;
-          if (typeof endpoint.authorizer === 'object') {
-            if (endpoint.authorizer.arn) {
-              this.serverlessLog(`WARNING: Serverless Offline does not support non local authorizers: ${endpoint.authorizer.arn}`);
-
-              return;
-            }
-            authFunctionName = endpoint.authorizer.name;
-          }
-
-          this.serverlessLog(`Configuring Authorization: ${endpoint.path} ${authFunctionName}`);
-
-          const authFunction = this.service.getFunction(authFunctionName);
-
-          if (!authFunction) return this.serverlessLog(`WARNING: Authorization function ${authFunctionName} does not exist`);
-
-          let authorizerOptions = {};
-          if (typeof endpoint.authorizer === 'string') {
-            // serverless 1.x will create default values, so we will to
-            authorizerOptions.name = authFunctionName;
-            authorizerOptions.resultTtlInSeconds = '300';
-            authorizerOptions.identitySource = 'method.request.header.Authorization';
-          }
-          else {
-            authorizerOptions.identitySource = endpoint.authorizer.identitySource ||
-              'method.request.header.Authorization'; // See #207
-            authorizerOptions = endpoint.authorizer;
-          }
-
-          // Create a unique scheme per endpoint
-          // This allows the methodArn on the event property to be set appropriately
-          const authKey = `${funName}-${authFunctionName}-${method}-${epath}`;
-          const authSchemeName = `scheme-${authKey}`;
-          authStrategyName = `strategy-${authKey}`; // set strategy name for the route config
-
-          debugLog(`Creating Authorization scheme for ${authKey}`);
-
-          // Create the Auth Scheme for the endpoint
-          const scheme = createAuthScheme(
-            authFunction,
-            authorizerOptions,
-            funName,
-            epath,
-            this.options,
-            this.serverlessLog,
-            servicePath
-          );
-
-          // Set the auth scheme and strategy on the server
-          this.server.auth.scheme(authSchemeName, scheme);
-          this.server.auth.strategy(authStrategyName, authSchemeName);
-        }
+        const authStrategyName = this.options.noAuth ? null : this._configureAuthorization(endpoint, funName, method, epath, servicePath, serviceRuntime);
 
         let cors = null;
         if (endpoint.cors) {
@@ -439,18 +455,40 @@ class Offline {
             origin: endpoint.cors.origins || this.options.corsConfig.origin,
             headers: endpoint.cors.headers || this.options.corsConfig.headers,
             credentials: endpoint.cors.credentials || this.options.corsConfig.credentials,
+            exposedHeaders: this.options.corsConfig.exposedHeaders,
           };
         }
 
         // Route creation
         const routeMethod = method === 'ANY' ? '*' : method;
-        let routeConfig = {
+
+        const state = this.options.disableCookieValidation ? {
+          parse: false,
+          failAction: 'ignore',
+        } : {
+            parse: true,
+            failAction: 'error',
+          };
+
+        const routeConfig = {
           cors,
           auth: authStrategyName,
+          timeout: { socket: false },
+          state,
         };
 
-        if(routeMethod !== 'HEAD' && routeMethod !== 'GET'){
-          routeConfig.payload = { parse: false }
+        // skip HEAD routes as hapi will fail with 'Method name not allowed: HEAD ...'
+        // for more details, check https://github.com/dherault/serverless-offline/issues/204
+        if (routeMethod === 'HEAD') {
+          this.serverlessLog('HEAD method event detected. Skipping HAPI server route mapping ...');
+
+          return;
+        }
+
+        if (routeMethod !== 'HEAD' && routeMethod !== 'GET') {
+          // maxBytes: Increase request size from 1MB default limit to 10MB.
+          // Cf AWS API GW payload limits.
+          routeConfig.payload = { parse: false, maxBytes: 1024 * 1024 * 10 };
         }
 
         this.server.route({
@@ -458,23 +496,57 @@ class Offline {
           path: fullPath,
           config: routeConfig,
           handler: (request, reply) => { // Here we go
-            request.payload = request.payload && request.payload.toString();
+            // Payload processing
+            const encoding = utils.detectEncoding(request);
 
-            this.printBlankLine();
-            this.serverlessLog(`${method} ${request.path} (λ: ${funName})`);
-            if (firstCall) {
-              this.serverlessLog('The first request might take a few extra seconds');
-              firstCall = false;
+            request.payload = request.payload && request.payload.toString(encoding);
+            request.rawPayload = request.payload;
+
+            // Headers processing
+            // Hapi lowercases the headers whereas AWS does not
+            // so we recreate a custom headers object from the raw request
+            const headersArray = request.raw.req.rawHeaders;
+
+            // During tests, `server.inject` uses *shot*, a package
+            // for performing injections that does not entirely mimick
+            // Hapi's usual request object. rawHeaders are then missing
+            // Hence the fallback for testing
+
+            // Normal usage
+            if (headersArray) {
+              request.unprocessedHeaders = {};
+              request.multiValueHeaders = {};
+
+              for (let i = 0; i < headersArray.length; i += 2) {
+                request.unprocessedHeaders[headersArray[i]] = headersArray[i + 1];
+                request.multiValueHeaders[headersArray[i]] = (request.multiValueHeaders[headersArray[i]] || []).concat(headersArray[i + 1]);
+              }
+            }
+            // Lib testing
+            else {
+              request.unprocessedHeaders = request.headers;
             }
 
-            this.serverlessLog(protectedRoutes);
+            // Incomming request message
+            this.printBlankLine();
+            this.serverlessLog(`${method} ${request.path} (λ: ${funName})`);
+
             // Check for APIKey
-            if (_.includes(protectedRoutes, fullPath)) {
+            if ((protectedRoutes.includes(`${routeMethod}#${fullPath}`) || protectedRoutes.includes(`ANY#${fullPath}`)) && !this.options.noAuth) {
               const errorResponse = response => response({ message: 'Forbidden' }).code(403).type('application/json').header('x-amzn-ErrorType', 'ForbiddenException');
+
               if ('x-api-key' in request.headers) {
                 const requestToken = request.headers['x-api-key'];
                 if (requestToken !== this.options.apiKey) {
                   debugLog(`Method ${method} of function ${funName} token ${requestToken} not valid`);
+
+                  return errorResponse(reply);
+                }
+              }
+              else if (request.auth && request.auth.credentials && 'usageIdentifierKey' in request.auth.credentials) {
+                const usageIdentifierKey = request.auth.credentials.usageIdentifierKey;
+                if (usageIdentifierKey !== this.options.apiKey) {
+                  debugLog(`Method ${method} of function ${funName} token ${usageIdentifierKey} not valid`);
 
                   return errorResponse(reply);
                 }
@@ -486,7 +558,7 @@ class Offline {
               }
             }
             // Shared mutable state is the root of all evil they say
-            const requestId = Math.random().toString().slice(2);
+            const requestId = utils.randomId();
             this.requests[requestId] = { done: false };
             this.currentRequestId = requestId;
 
@@ -500,7 +572,7 @@ class Offline {
             // https://hapijs.com/api#route-configuration doesn't seem to support selectively parsing
             // so we have to do it ourselves
             const contentTypesThatRequirePayloadParsing = ['application/json', 'application/vnd.api+json'];
-            if (contentTypesThatRequirePayloadParsing.indexOf(contentType) !== -1) {
+            if (contentTypesThatRequirePayloadParsing.includes(contentType)) {
               try {
                 request.payload = JSON.parse(request.payload);
               }
@@ -517,8 +589,30 @@ class Offline {
             /* HANDLER LAZY LOADING */
 
             let handler; // The lambda function
+            Object.assign(process.env, this.originalEnvironment);
 
             try {
+              if (this.options.noEnvironment) {
+                // This evict errors in server when we use aws services like ssm
+                const baseEnvironment = {
+                  AWS_REGION: 'dev',
+                };
+                if (!process.env.AWS_PROFILE) {
+                  baseEnvironment.AWS_ACCESS_KEY_ID = 'dev';
+                  baseEnvironment.AWS_SECRET_ACCESS_KEY = 'dev';
+                }
+
+                process.env = Object.assign(baseEnvironment, process.env);
+              }
+              else {
+                Object.assign(
+                  process.env,
+                  { AWS_REGION: this.service.provider.region },
+                  this.service.provider.environment,
+                  this.service.functions[key].environment
+                );
+              }
+              process.env._HANDLER = fun.handler;
               handler = functionHelper.createHandler(funOptions, this.options);
             }
             catch (err) {
@@ -561,7 +655,7 @@ class Offline {
             debugLog('event:', event);
 
             // We create the context, its callback (context.done/succeed/fail) will send the HTTP response
-            const lambdaContext = createLambdaContext(fun, (err, data) => {
+            const lambdaContext = createLambdaContext(fun, (err, data, fromPromise) => {
               // Everything in this block happens once the lambda function has resolved
               debugLog('_____ HANDLER RESOLVED _____');
 
@@ -571,7 +665,10 @@ class Offline {
               // User should not call context.done twice
               if (this.requests[requestId].done) {
                 this.printBlankLine();
-                this.serverlessLog(`Warning: context.done called twice within handler '${funName}'!`);
+                const warning = fromPromise
+                  ? `Warning: handler '${funName}' returned a promise and also uses a callback!\nThis is problematic and might cause issues in your lambda.`
+                  : `Warning: context.done called twice within handler '${funName}'!`;
+                this.serverlessLog(warning);
                 debugLog('requestId:', requestId);
 
                 return;
@@ -582,12 +679,22 @@ class Offline {
               let result = data;
               let responseName = 'default';
               const responseContentType = endpoint.responseContentType;
+              const contentHandling = endpoint.contentHandling;
 
               /* RESPONSE SELECTION (among endpoint's possible responses) */
 
               // Failure handling
               let errorStatusCode = 0;
               if (err) {
+                // Since the --useSeparateProcesses option loads the handler in
+                // a separate process and serverless-offline communicates with it
+                // over IPC, we are unable to catch JavaScript unhandledException errors
+                // when the handler code contains bad JavaScript. Instead, we "catch"
+                // it here and reply in the same way that we would have above when
+                // we lazy-load the non-IPC handler function.
+                if (this.options.useSeparateProcesses && err.ipcException) {
+                  return this._reply500(response, `Error while loading ${funName}`, err, requestId);
+                }
 
                 const errorMessage = (err.message || err).toString();
 
@@ -608,6 +715,7 @@ class Offline {
                 };
 
                 this.serverlessLog(`Failure: ${errorMessage}`);
+
                 if (result.stackTrace) {
                   debugLog(result.stackTrace.join('\n  '));
                 }
@@ -627,7 +735,7 @@ class Offline {
 
               const responseParameters = chosenResponse.responseParameters;
 
-              if (_.isPlainObject(responseParameters)) {
+              if (responseParameters) {
 
                 const responseParametersKeys = Object.keys(responseParameters);
 
@@ -686,12 +794,19 @@ class Offline {
               let statusCode = 200;
 
               if (integration === 'lambda') {
-                /* RESPONSE TEMPLATE PROCCESSING */
+
+                const endpointResponseHeaders = endpoint.response ? endpoint.response.headers : {};
+
+                Object.keys(endpointResponseHeaders)
+                  .filter(key => typeof endpointResponseHeaders[key] === 'string' && /^'.*?'$/.test(endpointResponseHeaders[key]))
+                  .forEach(key => response.header(key, endpointResponseHeaders[key].slice(1, endpointResponseHeaders[key].length - 1)));
+
+                /* LAMBDA INTEGRATION RESPONSE TEMPLATE PROCCESSING */
+
                 // If there is a responseTemplate, we apply it to the result
                 const responseTemplates = chosenResponse.responseTemplates;
 
-                if (_.isPlainObject(responseTemplates)) {
-
+                if (typeof responseTemplates === 'object') {
                   const responseTemplatesKeys = Object.keys(responseTemplates);
 
                   if (responseTemplatesKeys.length) {
@@ -699,7 +814,7 @@ class Offline {
                     // BAD IMPLEMENTATION: first key in responseTemplates
                     const responseTemplate = responseTemplates[responseContentType];
 
-                    if (responseTemplate) {
+                    if (responseTemplate && responseTemplate !== '\n') {
 
                       debugLog('_____ RESPONSE TEMPLATE PROCCESSING _____');
                       debugLog(`Using responseTemplate '${responseContentType}'`);
@@ -716,7 +831,7 @@ class Offline {
                   }
                 }
 
-                /* HAPIJS RESPONSE CONFIGURATION */
+                /* LAMBDA INTEGRATION HAPIJS RESPONSE CONFIGURATION */
 
                 statusCode = errorStatusCode !== 0 ? errorStatusCode : (chosenResponse.statusCode || 200);
 
@@ -728,17 +843,72 @@ class Offline {
                 response.header('Content-Type', responseContentType, {
                   override: false, // Maybe a responseParameter set it already. See #34
                 });
+
                 response.statusCode = statusCode;
-                response.source = result;
+
+                if (contentHandling === 'CONVERT_TO_BINARY') {
+                  response.encoding = 'binary';
+                  response.source = Buffer.from(result, 'base64');
+                  response.variety = 'buffer';
+                }
+                else {
+                  if (result && result.body && typeof result.body !== 'string') {
+                    return this._reply500(response, 'According to the API Gateway specs, the body content must be stringified. Check your Lambda response and make sure you are invoking JSON.stringify(YOUR_CONTENT) on your body object', {}, requestId);
+                  }
+                  response.source = result;
+                }
               }
               else if (integration === 'lambda-proxy') {
+
+                /* LAMBDA PROXY INTEGRATION HAPIJS RESPONSE CONFIGURATION */
+
                 response.statusCode = statusCode = result.statusCode || 200;
 
-                const defaultHeaders = { 'Content-Type': 'application/json' };
+                const headers = {};
+                if (result.headers) {
+                  Object.keys(result.headers).forEach(header => {
+                    headers[header] = (headers[header] || []).concat(result.headers[header]);
+                  });
+                }
+                if (result.multiValueHeaders) {
+                  Object.keys(result.multiValueHeaders).forEach(header => {
+                    headers[header] = (headers[header] || []).concat(result.multiValueHeaders[header]);
+                  });
+                }
 
-                Object.assign(response.headers, defaultHeaders, result.headers);
-                if (!_.isUndefined(result.body)) {
-                  response.source = result.body;
+                debugLog('headers', headers);
+
+                Object.keys(headers).forEach(header => {
+                  if (header.toLowerCase() === 'set-cookie') {
+                    headers[header].forEach(headerValue => {
+                      const cookieName = headerValue.slice(0, headerValue.indexOf('='));
+                      const cookieValue = headerValue.slice(headerValue.indexOf('=') + 1);
+                      reply.state(cookieName, cookieValue, { encoding: 'none', strictHeader: false });
+                    });
+                  }
+                  else {
+                    headers[header].forEach(headerValue => {
+                      // it looks like Hapi doesn't support multiple headers with the same name,
+                      // appending values is the closest we can come to the AWS behavior.
+                      response.header(header, headerValue, { append: true });
+                    });
+                  }
+                });
+
+                response.header('Content-Type', 'application/json', { override: false, duplicate: false });
+
+                if (typeof result.body !== 'undefined') {
+                  if (result.isBase64Encoded) {
+                    response.encoding = 'binary';
+                    response.source = Buffer.from(result.body, 'base64');
+                    response.variety = 'buffer';
+                  }
+                  else {
+                    if (result.body && typeof result.body !== 'string') {
+                      return this._reply500(response, 'According to the API Gateway specs, the body content must be stringified. Check your Lambda response and make sure you are invoking JSON.stringify(YOUR_CONTENT) on your body object', {}, requestId);
+                    }
+                    response.source = result.body;
+                  }
                 }
               }
 
@@ -752,7 +922,7 @@ class Offline {
                 // nothing
               }
               finally {
-                if (!this.options.dontPrintOutput) this.serverlessLog(err ? `Replying ${statusCode}` : `[${statusCode}] ${whatToLog}`);
+                if (this.options.printOutput) this.serverlessLog(err ? `Replying ${statusCode}` : `[${statusCode}] ${whatToLog}`);
                 debugLog('requestId:', requestId);
               }
 
@@ -768,13 +938,25 @@ class Offline {
               funOptions.funTimeout
             );
 
+            // If request body validation is enabled, validate body against the request model.
+            if (requestBodyValidationModel && !this.options.disableModelValidation) {
+              try {
+                requestBodyValidator.validate(requestBodyValidationModel, event.body);
+              }
+              catch (error) {
+                // When request body validation fails, APIG will return back 400 as detailed in:
+                // https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-method-request-validation.html
+                return this._replyError(400, response, `Invalid request body for '${funName}' handler`, error, requestId);
+              }
+            }
+
             // Finally we call the handler
             debugLog('_____ CALLING HANDLER _____');
             try {
               const x = handler(event, lambdaContext, lambdaContext.done);
 
               // Promise support
-              if (serviceRuntime === 'babel' && !this.requests[requestId].done) {
+              if (!this.requests[requestId].done) {
                 if (x && typeof x.then === 'function' && typeof x.catch === 'function') x.then(lambdaContext.succeed).catch(lambdaContext.fail);
                 else if (x instanceof Error) lambdaContext.fail(x);
               }
@@ -786,6 +968,70 @@ class Offline {
         });
       });
     });
+  }
+
+  _extractAuthFunctionName(endpoint) {
+    const result = authFunctionNameExtractor(endpoint, this.serverlessLog);
+
+    return result.unsupportedAuth ? null : result.authorizerName;
+  }
+
+  _configureAuthorization(endpoint, funName, method, epath, servicePath, serviceRuntime) {
+    if (!endpoint.authorizer) {
+      return null;
+    }
+
+    const authFunctionName = this._extractAuthFunctionName(endpoint);
+
+    if (!authFunctionName) {
+      return null;
+    }
+
+    this.serverlessLog(`Configuring Authorization: ${endpoint.path} ${authFunctionName}`);
+
+    const authFunction = this.service.getFunction(authFunctionName);
+
+    if (!authFunction) return this.serverlessLog(`WARNING: Authorization function ${authFunctionName} does not exist`);
+
+    const authorizerOptions = {
+      resultTtlInSeconds: '300',
+      identitySource: 'method.request.header.Authorization',
+      identityValidationExpression: '(.*)',
+    };
+
+    if (typeof endpoint.authorizer === 'string') {
+      authorizerOptions.name = authFunctionName;
+    }
+    else {
+      Object.assign(authorizerOptions, endpoint.authorizer);
+    }
+
+    // Create a unique scheme per endpoint
+    // This allows the methodArn on the event property to be set appropriately
+    const authKey = `${funName}-${authFunctionName}-${method}-${epath}`;
+    const authSchemeName = `scheme-${authKey}`;
+    const authStrategyName = `strategy-${authKey}`; // set strategy name for the route config
+
+    debugLog(`Creating Authorization scheme for ${authKey}`);
+
+    // Create the Auth Scheme for the endpoint
+    const scheme = createAuthScheme(
+      authFunction,
+      authorizerOptions,
+      authFunctionName,
+      epath,
+      this.options,
+      this.serverlessLog,
+      servicePath,
+      serviceRuntime,
+      this.serverless
+    );
+
+    // Set the auth scheme and strategy on the server
+    this.server.auth.scheme(authSchemeName, scheme);
+    this.server.auth.strategy(authStrategyName, authSchemeName);
+
+    return authStrategyName;
   }
 
   // All done, we can listen to incomming requests
@@ -804,12 +1050,13 @@ class Offline {
 
   end() {
     this.serverlessLog('Halting offline server');
+    functionHelper.cleanup();
     this.server.stop({ timeout: 5000 })
-    .then(() => process.exit(this.exitCode));
+      .then(() => process.exit(this.exitCode));
   }
 
   // Bad news
-  _reply500(response, message, err, requestId) {
+  _replyError(responseCode, response, message, err, requestId) {
 
     if (this._clearTimeout(requestId)) return;
 
@@ -818,10 +1065,17 @@ class Offline {
     const stackTrace = this._getArrayStackTrace(err.stack);
 
     this.serverlessLog(message);
-    console.log(stackTrace || err);
+    if (stackTrace && stackTrace.length > 0) {
+      console.log(stackTrace);
+    }
+    else {
+      console.log(err);
+    }
+
+    response.header('Content-Type', 'application/json');
 
     /* eslint-disable no-param-reassign */
-    response.statusCode = 200; // APIG replies 200 by default on failures
+    response.statusCode = responseCode;
     response.source = {
       errorMessage: message,
       errorType: err.constructor.name,
@@ -831,6 +1085,11 @@ class Offline {
     /* eslint-enable no-param-reassign */
     this.serverlessLog('Replying error in handler');
     response.send();
+  }
+
+  _reply500(response, message, err, requestId) {
+    // APIG replies 200 by default on failures
+    this._replyError(200, response, message, err, requestId);
   }
 
   _replyTimeout(response, funName, funTimeout, requestId) {
@@ -850,6 +1109,73 @@ class Offline {
     const timeout = this.requests[requestId].timeout;
     if (timeout && timeout._called) return true;
     clearTimeout(timeout);
+  }
+
+  _createResourceRoutes() {
+    if (!this.options.resourceRoutes) return true;
+    const resourceRoutesOptions = this.options.resourceRoutes;
+    const resourceRoutes = parseResources(this.service.resources);
+
+    if (!resourceRoutes || !Object.keys(resourceRoutes).length) return true;
+
+    this.printBlankLine();
+    this.serverlessLog('Routes defined in resources:');
+
+    Object.keys(resourceRoutes).forEach(methodId => {
+      const resourceRoutesObj = resourceRoutes[methodId];
+      const path = resourceRoutesObj.path;
+      const method = resourceRoutesObj.method;
+      const isProxy = resourceRoutesObj.isProxy;
+      const proxyUri = resourceRoutesObj.proxyUri;
+      const pathResource = resourceRoutesObj.pathResource;
+
+      if (!isProxy) {
+        return this.serverlessLog(`WARNING: Only HTTP_PROXY is supported. Path '${pathResource}' is ignored.`);
+      }
+      if (!path) {
+        return this.serverlessLog(`WARNING: Could not resolve path for '${methodId}'.`);
+      }
+
+      let fullPath = this.options.prefix + (pathResource.startsWith('/') ? pathResource.slice(1) : pathResource);
+      if (fullPath !== '/' && fullPath.endsWith('/')) fullPath = fullPath.slice(0, -1);
+      fullPath = fullPath.replace(/\+}/g, '*}');
+
+      const proxyUriOverwrite = resourceRoutesOptions[methodId] || {};
+      const proxyUriInUse = proxyUriOverwrite.Uri || proxyUri;
+
+      if (!proxyUriInUse) {
+        return this.serverlessLog(`WARNING: Could not load Proxy Uri for '${methodId}'`);
+      }
+
+      const routeMethod = method === 'ANY' ? '*' : method;
+      const routeConfig = { cors: this.options.corsConfig };
+
+      if (routeMethod !== 'HEAD' && routeMethod !== 'GET') {
+        routeConfig.payload = { parse: false };
+      }
+
+      this.serverlessLog(`${method} ${fullPath} -> ${proxyUriInUse}`);
+      this.server.route({
+        method: routeMethod,
+        path: fullPath,
+        config: routeConfig,
+        handler: (request, reply) => {
+          const params = request.params;
+          let resultUri = proxyUriInUse;
+
+          Object.keys(params).forEach(key => {
+            resultUri = resultUri.replace(`{${key}}`, params[key]);
+          });
+
+          if (request.url.search !== null) {
+            resultUri += request.url.search; // search is empty string by default
+          }
+
+          this.serverlessLog(`PROXY ${request.method} ${request.url.path} -> ${resultUri}`);
+          reply.proxy({ uri: resultUri, passThrough: true });
+        },
+      });
+    });
   }
 
   _create404Route() {
@@ -888,5 +1214,9 @@ class Offline {
     process.exit(0);
   }
 }
+
+// Serverless exits with code 1 when a promise rejection is unhandled. Not AWS.
+// Users can still use their own unhandledRejection event though.
+process.removeAllListeners('unhandledRejection');
 
 module.exports = Offline;

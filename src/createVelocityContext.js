@@ -1,13 +1,10 @@
-'use strict';
-
 const utils = require('./utils');
 const jsonPath = require('./jsonPath');
 const jsEscapeString = require('js-string-escape');
-const isPlainObject = require('lodash').isPlainObject;
 
 function escapeJavaScript(x) {
   if (typeof x === 'string') return jsEscapeString(x).replace(/\\n/g, '\n'); // See #26,
-  else if (isPlainObject(x)) {
+  else if (utils.isPlainObject(x)) {
     const result = {};
     for (let key in x) { // eslint-disable-line prefer-const
       result[key] = jsEscapeString(x[key]);
@@ -28,10 +25,7 @@ module.exports = function createVelocityContext(request, options, payload) {
 
   const path = x => jsonPath(payload || {}, x);
   const authPrincipalId = request.auth && request.auth.credentials && request.auth.credentials.user;
-
-  // Capitalize request.headers as NodeJS use lowercase headers
-  // however API Gateway always pass capitalize headers
-  const headers = utils.capitalizeKeys(request.headers);
+  const headers = request.unprocessedHeaders;
 
   return {
     context: {
@@ -51,7 +45,7 @@ module.exports = function createVelocityContext(request, options, payload) {
         userAgent:                     request.headers['user-agent'] || '',
         userArn:                       'offlineContext_userArn',
       },
-      requestId:    `offlineContext_requestId_${Math.random().toString(10).slice(2)}`,
+      requestId:    `offlineContext_requestId_${utils.randomId()}`,
       resourceId:   'offlineContext_resourceId',
       resourcePath: request.route.path,
       stage:        options.stage,
@@ -61,18 +55,18 @@ module.exports = function createVelocityContext(request, options, payload) {
       json:   x => JSON.stringify(path(x)),
       params: x => typeof x === 'string' ?
         request.params[x] || request.query[x] || headers[x] :
-        {
-          path:        Object.assign({}, request.params),
+        ({
+          path: Object.assign({}, request.params),
           querystring: Object.assign({}, request.query),
-          header:      headers,
-        },
+          header: headers,
+        }),
       path,
     },
     stageVariables: options.stageVariables,
     util: {
       escapeJavaScript,
       urlEncode: encodeURI,
-      urlDecode: decodeURI,
+      urlDecode: x => decodeURIComponent(x.replace(/\+/g, ' ')),
       base64Encode: x => new Buffer(x.toString(), 'binary').toString('base64'),
       base64Decode: x => new Buffer(x.toString(), 'base64').toString('binary'),
       parseJson: JSON.parse,

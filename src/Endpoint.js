@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Endpoint class to return a valid handpoint for offline to handle
  * requires serverless service and http Event data to be merged in
@@ -7,9 +5,6 @@
  *
  * bsoylu 8/16/2016
  */
-
-// External depedencies
-const _ = require('lodash');
 
 // Node dependencies
 const fs = require('fs');
@@ -62,9 +57,9 @@ class Endpoint {
       // determine response template
       const resFilename = `${this.options.handlerPath}.res.vm`;
       fep.responseContentType = this.getResponseContentType(fep);
-      debugLog('Response Content-Type ', this.responseContentType);
+      debugLog('Response Content-Type ', fep.responseContentType);
       // load response template from http response template, or load file if exists other use default
-      if (fep.response.template) {
+      if (fep.response && fep.response.template) {
         fep.responses.default.responseTemplates[fep.responseContentType] = fep.response.template;
       }
       else if (fs.existsSync(resFilename)) {
@@ -98,13 +93,12 @@ class Endpoint {
     debugLog(`Error: ${err}`);
   }
 
-    /*
-     * return the fully generated Endpoint
-     */
+  /*
+   * return the fully generated Endpoint
+   */
   generate() {
 
-    let fullEndpoint = {};
-    _.merge(fullEndpoint, endpointStruct, this.httpData);
+    let fullEndpoint = Object.assign({}, JSON.parse(JSON.stringify(endpointStruct)), this.httpData);
 
     if (this.httpData.integration && this.httpData.integration === 'lambda') {
       // determine request and response templates or use defaults
