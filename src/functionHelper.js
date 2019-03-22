@@ -78,14 +78,13 @@ function runProxyHandler(funOptions, options) {
 
 let requireOverrides = [];
 
-function doRequire(options) {
-  const key = `${options.handlerPath}.${options.handlerName}`;
-  const override = requireOverrides[key];
+function doRequire(handlerPath) {
+  const override = requireOverrides[handlerPath];
   if (override) {
     debugLog(`Calling overridden require for ${key}`);
     return override();
   }
-  return require(options.handlerPath);
+  return require(handlerPath);
 }
 
 module.exports = {
@@ -217,9 +216,8 @@ module.exports = {
 
   // Takes options: { handlerPath: 'foo', handlerName: 'baz', doRequire: () => my_require('foo') }
   overrideRequire(options) {
-    const key = `${options.handlerPath}.${options.handlerName}`
-    debugLog(`Overriding require for ${key}`);
-    requireOverrides[key] = options.doRequire
+    debugLog(`Overriding require for ${handlerPath}`);
+    requireOverrides[handlerPath] = options.doRequire
   },
 
   cleanup() {
